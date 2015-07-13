@@ -1,0 +1,9 @@
+*.h
+BLE_Battery_Level01.cydsn/
+codegentemp/
+Generated_Source/
+CortexM0/
+BLE_Shared_Memory_Bootloadable01.cydsn/
+*.cyprj.*
+*.cywrk.*
+*.rpt
