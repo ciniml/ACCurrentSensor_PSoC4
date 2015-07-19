@@ -42,18 +42,38 @@ static uint32_t sensorValue = 0;
 static uint8_t sensorCount = 0;
 static bool isSensorValueUpdated = false;
 static bool isNotificationEnabled = false;
+typedef enum 
+{
+    ADC_STATE_SENSOR,
+    ADC_STATE_BATTERY,
+} ADC_STATE;
+static ADC_STATE adcState = ADC_STATE_SENSOR;
 
 CY_ISR(ADC_Interrupt_Handler)
 {
     uint32_t intr_status = ADC_SAR_SEQ_SAR_INTR_REG;
     int16_t value = ADC_SAR_SEQ_GetResult16(0);
-    sensorAccumulator += value < 0 ? -value : value;
     
-    sensorCount = (sensorCount + 1) & 127;
-    if( sensorCount == 0 )
+    switch(adcState)
     {
-        sensorValue = sensorAccumulator;
-        sensorAccumulator = 0;
+    case ADC_STATE_SENSOR:
+        sensorAccumulator += value < 0 ? -value : value;
+        sensorCount = (sensorCount + 1) & 127;
+        if( sensorCount == 0 )
+        {
+            sensorValue = sensorAccumulator >> (7 + 2);
+            sensorAccumulator = 0;
+            // TODO: start to measure battery level at next conversion.
+            ADC_SAR_SEQ_StartConvert();
+        }
+        else
+        {
+            ADC_SAR_SEQ_StartConvert();
+        }
+        break;
+    case ADC_STATE_BATTERY:
+        adcState = ADC_STATE_SENSOR;
+        break;
     }
     ADC_SAR_SEQ_SAR_INTR_REG = intr_status;
 }
@@ -82,14 +102,20 @@ static void BleCallback(uint32 eventCode, void *eventParam)
     case CYBLE_EVT_STACK_ON:
     case CYBLE_EVT_GAP_DEVICE_DISCONNECTED:
         // Start Advertisement
+        UART_Debug_UartPutString("GAP_DEVICE_DISCONNECTED\n");
         CyBle_GappStartAdvertisement(CYBLE_ADVERTISING_FAST);
         break;
     case CYBLE_EVT_GAP_DEVICE_CONNECTED:
-        UART_Debug_UartPutString("Connected\n");
+        UART_Debug_UartPutString("GAP_DEVICE_CONNECTED\n");
         break;
-        
+    case CYBLE_EVT_TIMEOUT:
+        UART_Debug_UartPutString("TIMEOUT\n");
+        break;
+    case CYBLE_EVT_GAPP_ADVERTISEMENT_START_STOP:
+        UART_Debug_UartPutString("ADVERTISEMENT_START_STOP\n");
+        break;
     case CYBLE_EVT_GATT_CONNECT_IND:
-        UART_Debug_UartPutString("EVT_GATT_CONNECT_IND\n");
+        UART_Debug_UartPutString("GATT_CONNECT_IND\n");
         /* Register service specific callback functions and init CCCD values */
         CYBLE_GATT_DB_ATTR_HANDLE_T handle = cyBle_customs[0].customServiceInfo[0].customServiceCharHandle;
         CyBle_GattsEnableAttribute(handle);
@@ -106,24 +132,56 @@ static void BleCallback(uint32 eventCode, void *eventParam)
         }
         break;
     case CYBLE_EVT_GATT_DISCONNECT_IND:
-        UART_Debug_UartPutString("EVT_GATT_DISCONNECT_IND \r\n");
+        UART_Debug_UartPutString("GATT_DISCONNECT_IND \r\n");
         break;
         
     case CYBLE_EVT_GATTS_WRITE_REQ:
         // Write request
         {
             CYBLE_GATTS_WRITE_REQ_PARAM_T* param = (CYBLE_GATTS_WRITE_REQ_PARAM_T*)eventParam;
-            if( param->handleValPair.attrHandle == CYBLE_CURRENT_SENSING_SERVICE_CURRENT_CLIENT_CHARACTERISTIC_CONFIGURATION_DESC_HANDLE ) 
+            switch(param->handleValPair.attrHandle)
             {
-                if( param->handleValPair.value.len > 0 )
+            case CYBLE_CURRENT_SENSING_SERVICE_CURRENT_CLIENT_CHARACTERISTIC_CONFIGURATION_DESC_HANDLE:
                 {
-                    uint8_t value = *param->handleValPair.value.val;
-                    isNotificationEnabled = value != 0;
+                    if( param->handleValPair.value.len > 0 )
+                    {
+                        uint8_t value = *param->handleValPair.value.val;
+                        isNotificationEnabled = value != 0;
+                    }
+                    CyBle_GattsWriteAttributeValue(&param->handleValPair, 0, &param->connHandle, CYBLE_GATT_DB_LOCALLY_INITIATED);
+                    CyBle_GattsWriteRsp(param->connHandle);
                 }
-                CyBle_GattsWriteAttributeValue(&param->handleValPair, 0, &param->connHandle, CYBLE_GATT_DB_LOCALLY_INITIATED);
-                CyBle_GattsWriteRsp(param->connHandle);
+                break;
+            case CYBLE_CURRENT_SENSING_SERVICE_COEFFICIENT_CHAR_HANDLE:
+                {
+                    if( param->handleValPair.value.len >= 8 )
+                    {
+                        CyBle_GattsWriteAttributeValue(&param->handleValPair, 0, &param->connHandle, CYBLE_GATT_DB_PEER_INITIATED);
+                    }
+                    CyBle_GattsWriteRsp(param->connHandle);
+                }
+                break;
             }
         }
+        break;
+    case CYBLE_EVT_HCI_STATUS:
+        {
+            char line[4];
+            char* p = line;
+            
+            UART_Debug_UartPutString("EVT_HCI_STATUS: ");
+            p = writeHex8(p, *(uint8_t*)eventParam);
+            
+            *(p++) = '\n';
+            *(p++) = 0;
+            UART_Debug_UartPutString(line);
+        }
+        break;
+//    case CYBLE_EVT_PENDING_FLASH_WRITE:
+//        {
+//            CyBle_StoreBondingData(false);
+//        }
+//        break;
     default:
         {
             char line[10];
