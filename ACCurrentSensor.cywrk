@@ -10,8 +10,8 @@
 <v>.\ACCurrentSensor.cydsn\ACCurrentSensor.cyprj</v>
 </projects>
 <workspace_id v="6fefdcba-19c5-45e4-9398-6a245fd93658" />
-<WriteAppVersionLastSavedWith v="3.1.0.2177" />
-<WriteAppMarketingVersionLastSavedWith v="3.1 SP2" />
+<WriteAppVersionLastSavedWith v="3.3.0.410" />
+<WriteAppMarketingVersionLastSavedWith v="3.3 CP1" />
 <CyGuid_dcbd9771-0334-43dc-9cc3-fe99dc3c5316 type_name="CyDesigner.Common.ProjMgmt.Model.CyPrjDependencyList" version="4">
 <wrkspc_dependencies />
 </CyGuid_dcbd9771-0334-43dc-9cc3-fe99dc3c5316>

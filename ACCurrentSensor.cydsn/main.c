@@ -1,18 +1,26 @@
 /* ========================================
- *
- * Copyright YOUR COMPANY, THE YEAR
- * All Rights Reserved
- * UNPUBLISHED, LICENSED SOFTWARE.
- *
- * CONFIDENTIAL AND PROPRIETARY INFORMATION
- * WHICH IS THE PROPERTY OF your company.
- *
+ * main module of AC current sensor.
+ * Copyright 2016 Kenta IDA
+ * This software 
  * ========================================
 */
 #include <project.h>
 #include <stdint.h>
 #include <stdbool.h>
 
+//#define DEBUG_OUT
+#ifdef DEBUG_OUT
+static void UartPutString(const char* s) { UART_Debug_UartPutString(s); }
+#else
+static void UartPutString(const char* s) {}
+#endif
+
+/***
+ * @brief Format a 8bit value in hexadecimal.
+ * @param p Pointer to a buffer to which this function writes a formatted value.
+ * @param n A 8bit value to format.
+ * @return Pointer to next location in the buffer.
+ */
 static char* writeHex8(char* p, uint8_t n)
 {
     uint8_t nibble;
@@ -22,12 +30,24 @@ static char* writeHex8(char* p, uint8_t n)
     *(p++) = nibble < 0x0a ? nibble + '0' : nibble + 'A' - 0x0a;
     return p;
 }
+/***
+ * @brief Format a 16 bit value in hexadecimal.
+ * @param p Pointer to a buffer to which this function writes a formatted value.
+ * @param n A 16 bit value to format.
+ * @return Pointer to next location in the buffer.
+*/
 static char* writeHex16(char* p, uint16_t n)
 {
     p = writeHex8(p, n >> 8);
     p = writeHex8(p, n & 0xff);
     return p;
 }
+/***
+ * @brief Format a 32 bit value in hexadecimal.
+ * @param p Pointer to a buffer to which this function writes a formatted value.
+ * @param n A 32 bit value to format.
+ * @return Pointer to next location in the buffer.
+ */
 static char* writeHex32(char* p, uint32_t n)
 {
     p = writeHex8(p, (n >> 24) & 0xff);
@@ -37,18 +57,25 @@ static char* writeHex32(char* p, uint32_t n)
     return p;
 }
 
-static uint32_t sensorAccumulator = 0;
-static uint32_t sensorValue = 0;
-static uint8_t sensorCount = 0;
-static bool isSensorValueUpdated = false;
-static bool isNotificationEnabled = false;
+static uint32_t sensorAccumulator = 0;      ///< Raw sensor value accumulator.
+static uint32_t sensorValue = 0;            ///< Processed sensor value.
+static uint8_t sensorCount = 0;             ///< A counter to count number of samples acquired.
+static bool isNotificationEnabled = false;  ///< Notification to the central is enabled or not.
+
+/**
+ * @brief ADC state.
+ */
 typedef enum 
 {
-    ADC_STATE_SENSOR,
-    ADC_STATE_BATTERY,
+    ADC_STATE_IDLE,
+    ADC_STATE_ACTIVE,
+    ADC_STATE_COMPLETED,
 } ADC_STATE;
-static ADC_STATE adcState = ADC_STATE_SENSOR;
+static ADC_STATE adcState = ADC_STATE_IDLE; ///< Current ADC state.
 
+/**
+ * @brief ADC conversion complete interrupt handler
+ */
 CY_ISR(ADC_Interrupt_Handler)
 {
     uint32_t intr_status = ADC_SAR_SEQ_SAR_INTR_REG;
@@ -56,43 +83,36 @@ CY_ISR(ADC_Interrupt_Handler)
     
     switch(adcState)
     {
-    case ADC_STATE_SENSOR:
-        sensorAccumulator += value < 0 ? -value : value;
-        sensorCount = (sensorCount + 1) & 127;
-        if( sensorCount == 0 )
+    case ADC_STATE_ACTIVE:  // If the ADC processing is active.
+        sensorAccumulator += value < 0 ? -value : value;    // Accumulate absolute value of raw sensor data.
+        sensorCount = (sensorCount + 1) & 63;               // Count up number of samples acquried (mod 63)
+        if( sensorCount == 0 )  // Acquired 64 samples.
         {
-            sensorValue = sensorAccumulator >> (7 + 2);
-            sensorAccumulator = 0;
-            // TODO: start to measure battery level at next conversion.
-            ADC_SAR_SEQ_StartConvert();
+            sensorValue = sensorAccumulator >> (6 + 2); // Calculate the average of acquired samples. ( divide by (64 * 4) )
+            sensorAccumulator = 0;                      // Clear the accumulator.
+            adcState = ADC_STATE_COMPLETED;             // Transit to COMPLETED state.
+            ADC_SAR_SEQ_Stop();                         // And turn off the ADC.
         }
-        else
-        {
-            ADC_SAR_SEQ_StartConvert();
-        }
-        break;
-    case ADC_STATE_BATTERY:
-        adcState = ADC_STATE_SENSOR;
         break;
     }
     ADC_SAR_SEQ_SAR_INTR_REG = intr_status;
 }
 
-CY_ISR(ReportTimerInterrupt_Handler)
+/**
+ * @brief Watchdog timeout interrupt handler
+ */
+CY_ISR(WatchDog_Interrupt_Handler)
 {
-    uint32_t intr_status = Timer_Report_INTERRUPT_REQ_REG;
-    char line[10];
-    char* p = line;
+    if( adcState == ADC_STATE_IDLE )    // If the watchdog timer has expired, initiate to measure AC current.
+    {
+        // Activate the ADC process.
+        adcState = ADC_STATE_ACTIVE;
+        ADC_SAR_SEQ_Start();
+        ADC_SAR_SEQ_StartConvert();
+    }
+    //Pin_LED_R_Write(~Pin_LED_R_ReadDataReg());
     
-    p = writeHex32(p, sensorValue);
-    
-    *(p++) = '\n';
-    *(p++) = 0;
-    UART_Debug_UartPutString(line);
-    
-    isSensorValueUpdated = true;
-    
-    Timer_Report_INTERRUPT_REQ_REG = intr_status;
+    CySysWdtClearInterrupt(CY_SYS_WDT_COUNTER0_INT);
 }
 
 static void BleCallback(uint32 eventCode, void *eventParam)
@@ -102,20 +122,35 @@ static void BleCallback(uint32 eventCode, void *eventParam)
     case CYBLE_EVT_STACK_ON:
     case CYBLE_EVT_GAP_DEVICE_DISCONNECTED:
         // Start Advertisement
-        UART_Debug_UartPutString("GAP_DEVICE_DISCONNECTED\n");
+        UartPutString("GAP_DEVICE_DISCONNECTED\n");
         CyBle_GappStartAdvertisement(CYBLE_ADVERTISING_FAST);
         break;
     case CYBLE_EVT_GAP_DEVICE_CONNECTED:
-        UART_Debug_UartPutString("GAP_DEVICE_CONNECTED\n");
+        UartPutString("GAP_DEVICE_CONNECTED\n");
+        // Update connection parameters
+        {
+            CYBLE_GAP_CONN_UPDATE_PARAM_T connParam = {
+                800,
+                800,
+                0,
+                500,
+            };
+            
+            CyBle_L2capLeConnectionParamUpdateRequest(cyBle_connHandle.bdHandle, &connParam);
+        }
         break;
     case CYBLE_EVT_TIMEOUT:
-        UART_Debug_UartPutString("TIMEOUT\n");
+        UartPutString("TIMEOUT\n");
         break;
     case CYBLE_EVT_GAPP_ADVERTISEMENT_START_STOP:
-        UART_Debug_UartPutString("ADVERTISEMENT_START_STOP\n");
+        UartPutString("ADVERTISEMENT_START_STOP\n");
+        if( CyBle_GetState() != CYBLE_STATE_ADVERTISING )
+        {
+            CyBle_GappStartAdvertisement(CYBLE_ADVERTISING_SLOW);
+        }
         break;
     case CYBLE_EVT_GATT_CONNECT_IND:
-        UART_Debug_UartPutString("GATT_CONNECT_IND\n");
+        UartPutString("GATT_CONNECT_IND\n");
         /* Register service specific callback functions and init CCCD values */
         CYBLE_GATT_DB_ATTR_HANDLE_T handle = cyBle_customs[0].customServiceInfo[0].customServiceCharHandle;
         CyBle_GattsEnableAttribute(handle);
@@ -131,10 +166,71 @@ static void BleCallback(uint32 eventCode, void *eventParam)
             CyBle_DisRegisterAttrCallback(BleCallback);
         }
         break;
+    case CYBLE_EVT_GAP_ENCRYPT_CHANGE:
+        {
+            char line[10];
+            char* p = line;
+            
+            UartPutString("EVT_GAP_ENCRYPT_CHANGE: ");
+            p = writeHex8(p, *(uint8_t*)eventParam);
+            
+            *(p++) = '\n';
+            *(p++) = 0;
+            UartPutString(line);
+        }
+        break;
+    case CYBLE_EVT_GAP_KEYINFO_EXCHNGE_CMPLT:
+        {
+            char line[80];
+            char* p = line;
+            
+            CYBLE_GAP_SMP_KEY_DIST_T * key = (CYBLE_GAP_SMP_KEY_DIST_T *)eventParam;
+            UartPutString("CYBLE_EVT_GAP_KEYINFO_EXCHNGE_CMPLT: ");
+            for(int i = 0; i < 16; i++)
+            {
+                p = writeHex8(p, key->ltkInfo[i]);
+            }
+            *(p++) = ',';
+            for(int i = 0; i < 10; i++)
+            {
+                p = writeHex8(p, key->midInfo[i]);
+            }
+            *(p++) = '\n';
+            *(p++) = 0;
+            UartPutString(line);
+        }
+        break;
     case CYBLE_EVT_GATT_DISCONNECT_IND:
-        UART_Debug_UartPutString("GATT_DISCONNECT_IND \r\n");
+        UartPutString("GATT_DISCONNECT_IND \r\n");
+        break;
+    
+    case CYBLE_EVT_GAP_PASSKEY_DISPLAY_REQUEST:
+        {
+            char line[10];
+            char* p = line;
+            
+            UartPutString("EVT_GAP_PASSKEY_DISPLAY_REQUEST: ");
+            p = writeHex32(p, *(uint32_t*)eventParam);
+            
+            *(p++) = '\n';
+            *(p++) = 0;
+            UartPutString(line);
+        }
         break;
         
+    case CYBLE_EVT_GAP_AUTH_FAILED:
+        {
+            char line[10];
+            char* p = line;
+            
+            UartPutString("EVT_GAP_AUTH_FAILED: ");
+            p = writeHex8(p, *(uint8_t*)eventParam);
+            
+            *(p++) = '\n';
+            *(p++) = 0;
+            UartPutString(line);
+        }
+        break;
     case CYBLE_EVT_GATTS_WRITE_REQ:
         // Write request
         {
@@ -169,12 +265,12 @@ static void BleCallback(uint32 eventCode, void *eventParam)
             char line[4];
             char* p = line;
             
-            UART_Debug_UartPutString("EVT_HCI_STATUS: ");
+            UartPutString("EVT_HCI_STATUS: ");
             p = writeHex8(p, *(uint8_t*)eventParam);
             
             *(p++) = '\n';
             *(p++) = 0;
-            UART_Debug_UartPutString(line);
+            UartPutString(line);
         }
         break;
 //    case CYBLE_EVT_PENDING_FLASH_WRITE:
@@ -186,10 +282,10 @@ static void BleCallback(uint32 eventCode, void *eventParam)
         {
             char line[10];
             char* p = line;
-            UART_Debug_UartPutString("Unknown Event: ");
+            UartPutString("Unknown Event: ");
             p = writeHex32(p, eventCode);
             *p++ = '\n'; *p = '0';
-            UART_Debug_UartPutString(line);
+            UartPutString(line);
         }
         break;
     }
@@ -197,53 +293,78 @@ static void BleCallback(uint32 eventCode, void *eventParam)
 
 int main()
 {
-    /* Place your initialization/startup code here (e.g. MyInst_Start()) */
-    Clock_1k_Start();
+
+#ifdef DEBUG_OUT
     UART_Debug_Start();
+#endif 
     ADC_SAR_SEQ_Start();
-    Timer_Report_Start();
+    OpUpper_Start();
+    OpLower_Start();
     
     sensorAccumulator = 0;
+    
+    ISR_WatchDog_StartEx(WatchDog_Interrupt_Handler);
+    CySysWdtEnable(CY_SYS_WDT_COUNTER0_MASK);
     
     ADC_SAR_SEQ_IRQ_SetVector(ADC_Interrupt_Handler);
     ADC_SAR_SEQ_IRQ_Enable();
     
-    ReportTimerInterrupt_SetVector(ReportTimerInterrupt_Handler);
-    ReportTimerInterrupt_Enable();
+    CyGlobalIntEnable;
+    CySysClkIloStop();
+//    CySysClkWriteEcoDiv(CY_SYS_CLK_ECO_DIV8);
     
     // Initialize BLE module
     CyBle_Start(BleCallback);
     
-    CyGlobalIntEnable;
+    UartPutString("ACCurrentSensor\n");    
     
-    ADC_SAR_SEQ_StartConvert();
     
-    UART_Debug_UartPutString("ACCurrentSensor\n");    
+    bool canEnterToDeepSleep = false;
     
     for(;;)
     {
         CyBle_ProcessEvents();
+        CyBle_EnterLPM(CYBLE_BLESS_DEEPSLEEP); 
         
         if( CyBle_GetState() == CYBLE_STATE_CONNECTED )
         {
-            if( isSensorValueUpdated )
+            switch(adcState)
             {
-                CYBLE_GATT_DB_ATTR_HANDLE_T handle = cyBle_customs[0].customServiceInfo[0].customServiceCharHandle;
+            case ADC_STATE_COMPLETED:
                 {
-                    CYBLE_GATTS_HANDLE_VALUE_NTF_T pair = {
-                        {(uint8_t*)&sensorValue, 4, 0},
-                        handle,
-                    };
-                    CyBle_GattsWriteAttributeValue(&pair, 0, &cyBle_connHandle, CYBLE_GATT_DB_LOCALLY_INITIATED);
-                    if( isNotificationEnabled )
+                    CYBLE_GATT_DB_ATTR_HANDLE_T handle = cyBle_customs[0].customServiceInfo[0].customServiceCharHandle;
                     {
-                        CyBle_GattsNotification(cyBle_connHandle, &pair);
+                        CYBLE_GATTS_HANDLE_VALUE_NTF_T pair = {
+                            {(uint8_t*)&sensorValue, 4, 0},
+                            handle,
+                        };
+                        CyBle_GattsWriteAttributeValue(&pair, 0, &cyBle_connHandle, CYBLE_GATT_DB_LOCALLY_INITIATED);
+                        if( isNotificationEnabled )
+                        {
+                            CyBle_GattsNotification(cyBle_connHandle, &pair);
+                        }
                     }
+                    //Pin_LED_G_Write(~Pin_LED_G_Read());
+                    adcState = ADC_STATE_IDLE;
+                    
+                    // The sensor value has been updated. Enter to deepsleep.
+                    canEnterToDeepSleep = true;
                 }
-                
-                isSensorValueUpdated = false;
+                break;
+            case ADC_STATE_IDLE:
+                canEnterToDeepSleep = true;
+                break;
+            case ADC_STATE_ACTIVE:
+                canEnterToDeepSleep = false;
+                break;
             }
         }
+        else
+        {
+            // Not connected. The system should enter to deepsleep.
+            canEnterToDeepSleep = true;
+        }
+
         
         /* Prevent interrupts while entering system low power modes */
         uint8 intrStatus = CyEnterCriticalSection();
@@ -253,25 +374,30 @@ int main()
         
         /* If BLESS is in Deep-Sleep mode or the XTAL oscillator is turning on, 
          * then PSoC 4 BLE can enter Deep-Sleep mode (1.3uA current consumption) */
-        if(blessState == CYBLE_BLESS_STATE_ECO_ON || 
-            blessState == CYBLE_BLESS_STATE_DEEPSLEEP)
+        if((blessState == CYBLE_BLESS_STATE_ECO_ON || blessState == CYBLE_BLESS_STATE_DEEPSLEEP) && canEnterToDeepSleep )
         {
             CySysPmDeepSleep();
         }
-        else if(blessState != CYBLE_BLESS_STATE_EVENT_CLOSE)
+        else
         {
             /* If BLESS is active, then configure PSoC 4 BLE system in 
              * Sleep mode (~1.6mA current consumption) */
             CySysPmSleep();
         }
-        else
-        {
-            /* Keep trying to enter either Sleep or Deep-Sleep mode */    
-        }
+        
         CyExitCriticalSection(intrStatus);
         
         /* BLE link layer timing interrupt will wake up the system from Sleep 
          * and Deep-Sleep modes */
+        /*
+        if( cyBle_pendingFlashWrite != 0 )
+        {
+            if( CyBle_StoreBondingData(0) == CYBLE_ERROR_OK )
+            {
+                UartPutString("Bonding data was stored.\n");
+            }
+        }
+        */
     }
 }
 
